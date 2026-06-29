@@ -1,1085 +1,910 @@
-# nanochat/gpt.py Transformer 架构详解
+# nanochat/gpt.py Transformer 架构详解（小白版）
 
-这是 nanochat 项目的核心模型文件，完整实现了现代 Transformer 架构，集成了 2023-2024 年的多项训练技巧。
+> 目标读者：刚接触大语言模型、能看懂一点 Python 和 PyTorch，但经常被论文里的术语砸晕的同学。
+>
+> 阅读建议：从头到尾按顺序读。每个新概念出现前，都会先解释“为什么需要它”。
+
+本文档讲解 `nanochat/gpt.py` 的实现。它用 PyTorch 从头写了一个现代 GPT 模型，默认配置下约 **286M** 参数（含 Value Embeddings），并加入了一些 2023-2024 年的训练技巧。
 
 ---
 
 ## 目录
 
-1. [模型整体结构](#1-模型整体结构)
-2. [Token Embedding 层](#2-token-embedding-层)
-3. [Block 层：注意力机制](#3-block-层注意力机制)
-4. [Block 层：Multi-Head 与 GQA](#4-block-层multi-head-与-gqa)
-5. [Block 层：RoPE 旋转位置编码](#5-block-层rope-旋转位置编码)
-6. [Block 层：MLP 与 Block 结构](#6-block-层mlp-与-block-结构)
-7. [前向传播流程](#7-前向传播流程)
-8. [nanochat 特殊设计](#8-nanochat-特殊设计)
-9. [GPTConfig 配置](#9-gptconfig-配置)
-10. [权重初始化](#10-权重初始化)
-11. [与 GPT-2 的对比](#11-与-gpt-2-的对比)
+1. [先把问题说清楚：GPT 到底在做什么？](#1-先把问题说清楚gpt-到底在做什么)
+2. [数据流总览：从一句话到下一个词](#2-数据流总览从一句话到下一个词)
+3. [Step 0：Token、Token ID 与 Embedding——把文字变成向量](#3-step-0tokentoken-id-与-embedding把文字变成向量)
+4. [Step 1：RMSNorm 归一化——让数值不要太“疯”](#4-step-1rmsnorm-归一化让数值不要太疯)
+5. [Step 2：Smear——让模型偷偷看一眼前一个词](#5-step-2smear让模型偷偷看一眼前一个词)
+6. [Step 3：保存 x0——防止模型“忘了初心”](#6-step-3保存-x0防止模型忘了初心)
+7. [Step 4：Transformer Block——模型的“大脑”](#7-step-4transformer-block模型的-大脑)
+   - 7.1 [为什么需要注意力？](#71-为什么需要注意力)
+   - 7.2 [Query / Key / Value 是什么？](#72-query--key--value-是什么)
+   - 7.3 [自注意力：一句话自己问自己](#73-自注意力一句话自己问自己)
+   - 7.4 [因果注意力：不能偷看后面的答案](#74-因果注意力不能偷看后面的答案)
+   - 7.5 [多头注意力：多双眼睛看不同关系](#75-多头注意力多双眼睛看不同关系)
+   - 7.6 [GQA：让推理更省显存](#76-gqa让推理更省显存)
+   - 7.7 [RoPE 旋转位置编码：让模型知道“第几个词”](#77-rope-旋转位置编码让模型知道第几个词)
+   - 7.8 [QK Norm + 1.2 缩放：让注意力更聚焦](#78-qk-norm--12-缩放让注意力更聚焦)
+   - 7.9 [Value Embeddings：给注意力加点“外部知识”](#79-value-embeddings给注意力加点外部知识)
+   - 7.10 [MLP：非线性变换，提取更抽象特征](#710-mlp非线性变换提取更抽象特征)
+8. [Step 5：Backout——把低级特征“减掉”](#8-step-5backout把低级特征减掉)
+9. [Step 6：LM Head + Softcap——输出每个词的得分](#9-step-6lm-head--softcap输出每个词的得分)
+10. [训练 vs 推理：KV Cache 是干嘛的？](#10-训练-vs-推理kv-cache-是干嘛的)
+11. [Sliding Window Attention：不是所有层都看全部上下文](#11-sliding-window-attention不是所有层都看全部上下文)
+12. [GPTConfig 配置参数解释](#12-gptconfig-配置参数解释)
+13. [权重初始化：模型一开始怎么“长”出来的](#13-权重初始化模型一开始怎么长出来的)
+14. [参数数量估算](#14-参数数量估算)
+15. [nanochat 与原版 GPT-2 的主要区别](#15-nanochat-与原版-gpt-2-的主要区别)
+16. [下一步看哪里](#16-下一步看哪里)
 
 ---
 
-## 1. 模型概览
+## 1. 先把问题说清楚：GPT 到底在做什么？
 
-### 1.1 什么是 GPT 模型
+### 1.1 一句话定义
 
-#### 1.1.1 GPT 名称解释
+**GPT = 给定前面的文字，预测下一个最可能出现的词。**
 
-**GPT = Generative Pre-trained Transformer**（生成式预训练 Transformer）
+比如：
 
-| 名称 | 含义 | 说明 |
-|------|------|------|
-| **Generative** | 生成式 | 给定前文，生成后续内容 |
-| **Pre-trained** | 预训练 | 在大规模数据上预先训练好的 |
-| **Transformer** | 核心架构 | 基于注意力机制的深度学习网络 |
-
-**一句话概括**：GPT 是一个能根据前文预测下一个词的深度学习模型。
-
-#### 1.1.2 GPT 模型解决什么问题？
-
-**核心任务：语言建模 (Language Modeling)**
-
-```
-输入: "今天天气真"
-              │
-              ▼
-模型预测: "好"  ← 最可能
-         "坏"
-         "冷"
+```text
+输入：今天天气真
+模型输出：好（概率 0.7）、热（0.2）、糟（0.1）...
 ```
 
-**语言建模 = 已知前文，预测下一个词**
+听起来很简单？是的。但就是因为这个任务简单，模型可以通过海量文本自学语法、常识、推理能力。
 
-| 问题类型 | 示例 | GPT 如何解决 |
-|----------|------|-------------|
-| **文本生成** | 写文章、写代码 | 自回归生成 |
-| **问答系统** | 回答问题 | 根据问题生成答案 |
-| **文本补全** | 代码补全、句子补全 | 预测下一个词 |
-| **对话系统** | 聊天机器人 | 根据对话历史生成回复 |
+### 1.2 生成式 Pre-trained 是什么意思？
 
-**本质理解**：GPT 解决的是 **"给定上下文，预测下一个词"** 这个看似简单的问题。当需要写一篇完整文章时，模型会一个词一个词地生成，每个词的生成都基于前面的所有词，最终形成连贯的文本。
-
-#### 1.1.3 什么是传播？
-
-**传播 = 信息在网络中流动和传递的过程**
-
-在神经网络中，"传播"描述的是数据如何在网络的各层之间流动：
-
-```
-        信息传播
-           │
-           ▼
-    ┌──────────────┐
-    │    输入层     │  ← 接收原始数据
-    └──────┬───────┘
-           ▼
-    ┌──────────────┐
-    │   隐藏层 1    │  ← 处理、转换信息
-    └──────┬───────┘
-           ▼
-    ┌──────────────┐
-    │   隐藏层 2    │  ← 继续处理
-    └──────┬───────┘
-           ▼
-    ┌──────────────┐
-    │    输出层     │  ← 产生最终结果
-    └──────────────┘
-```
-
-#### 1.1.4 有哪些传播类型？
-
-神经网络中有**两种核心传播**：
-
-| 类型 | 方向 | 作用 | 发生时机 |
-|------|------|------|----------|
-| **前向传播 (Forward)** | 输入 → 输出 | 计算预测结果 | 训练 & 推理 |
-| **反向传播 (Backpropagation)** | 输出 → 输入 | 计算梯度 | 仅训练 |
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    前向传播 (Forward)                     │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  输入 ──► 隐藏层1 ──► 隐藏层2 ──► 输出                    │
-│  x      w1·x+b   w2·h1+b   预测结果                      │
-│                                                         │
-│  特点：数据从左到右单向流动                               │
-│  目的：计算预测结果                                       │
-│                                                         │
-├─────────────────────────────────────────────────────────┤
-│                   反向传播 (Backpropagation)              │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  输出 ──► 隐藏层2 ──► 隐藏层1 ──► 输入                    │
-│  Loss   计算梯度   计算梯度   计算梯度                    │
-│                                                         │
-│  特点：数据从右到左反向流动                               │
-│  目的：计算每个参数该"怎么调整"                           │
-│  工具：链式法则 (Chain Rule)                             │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
-```
-
-#### 1.1.5 为什么使用前向传播？
-
-**前向传播是模型处理信息的必经之路**：
-
-| 场景 | 是否用前向传播 | 是否用反向传播 | 原因 |
-|------|---------------|---------------|------|
-| **训练时** | ✅ 需要 | ✅ 需要 | 学习如何正确预测 |
-| **推理时** | ✅ 需要 | ❌ 不需要 | 模型已训练好，只需预测 |
-
-**训练 vs 推理流程对比**：
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  训练阶段（学习如何预测）                                  │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  Step 1: 前向传播                                        │
-│  "今天天气真" ──► GPT ──► 预测: "好"(0.8)                │
-│                                                         │
-│  Step 2: 计算损失                                        │
-│  预测 vs 真实 → Loss = 0.22                              │
-│                                                         │
-│  Step 3: 反向传播                                        │
-│  链式法则计算每个参数的梯度                               │
-│                                                         │
-│  Step 4: 更新权重                                        │
-│  w = w - learning_rate × gradient                       │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
-                           │
-                           │ 训练完成后
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  推理阶段（使用模型预测）                                  │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  "今天天气真" ──► [前向传播] ──► "好"                     │
-│                      │                                   │
-│                      │ 只用前向传播！                     │
-│                      │ 不需要反向传播                      │
-│                      │ 不需要计算梯度                      │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
-```
-
-**为什么推理时必须用前向传播？**
-- 前向传播是**获取预测结果的唯一方式**
-- 模型已经训练好了，不需要再学习
-- 只需要把输入转成输出即可
-
-#### 1.1.6 组件一览
-
-GPT 模型由以下组件构成：
-
-```
-GPT
-├── transformer.wte         # Token Embedding (词嵌入)
-├── transformer.h [Block×12]  # 12层Transformer块
-├── lm_head                   # 预测头 (输出层)
-├── resid_lambdas            # 每层残差缩放系数
-├── x0_lambdas              # 初始embedding混合系数
-├── smear_gate + smear_lambda # Smear层 (类似bigram)
-├── backout_lambda          # Backout层 (中间残差减法)
-└── value_embeds            # Value Embeddings (ResFormer风格)
-```
-
-| 组件 | 通俗理解 | 作用 |
-|------|----------|------|
-| `wte` | 翻译员 | 把文字转成数字向量 |
-| `Block×12` | 12层大脑 | 逐层理解语义 |
-| `lm_head` | 决策者 | 把向量转成词表概率 |
-| `resid_lambdas` | 思考深度控制器 | 可学习的残差缩放 |
-| `smear_gate` | 上下文线索 | 混合前一个token的信息 |
-| `backout_lambda` | 纠错员 | 减去中间层残差 |
-| `value_embeds` | 知识注入 | ResFormer风格的额外知识 |
-
-### 1.2 前向传播顺序
-
-前向传播是数据从输入到输出的完整流程。下面对应 `nanochat/gpt.py` 行 428-472，详细解释每一步：
-
-#### 步骤 1：Token Embedding（行 428-430）
-
-```python
-x = self.transformer.wte(idx)  # 把 token 转成向量
-x = norm(x)                      # 归一化
-```
-
-**组件：`transformer.wte`**
-- **通俗理解**：把文字转成数字向量，像一个"翻译员"
-- **工作**：输入 token ID → 输出 n_embd 维向量
-- **类比**：查词典，每个字对应一个 768 维的向量表示
-
-#### 步骤 2：Smear 混合（行 436-449）
-
-```python
-gate = self.smear_lambda * sigmoid(self.smear_gate(x[:, 1:, :24]))
-x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
-```
-
-**组件：`smear_gate + smear_lambda`**
-- **通俗理解**：混合前一个词的信息，像提供"上下文线索"
-- **工作**：每个位置的向量 = 当前词 + gate × 前一个词
-- **类比**：读"林"字时，顺便记一下前面是"森"，帮助理解"森林"
-
-#### 步骤 3：保存初始 Embedding（行 452）
-
-```python
-x0 = x  # 保存初始 embedding，用于后续残差混合
-```
-
-**组件：`x0_lambdas`**
-- **通俗理解**：把最初的信息混合回来，像"复习笔记"
-- **用途**：在每一层结束后，混合初始 embedding，防止信息丢失
-
-#### 步骤 4：12 层 Transformer Block（行 456-461）
-
-```python
-for i, block in enumerate(self.transformer.h):
-    x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0  # 残差混合
-    ve = self.value_embeds[str(i)](idx).to(x.dtype)          # 知识注入
-    x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
-```
-
-**组件：`transformer.h (Block×12)` + `resid_lambdas` + `value_embeds`**
-
-| 子组件 | 通俗理解 | 作用 |
-|--------|----------|------|
-| `resid_lambdas` | 控制每层的"思考深度" | 可学习的残差缩放系数，像音量旋钮 |
-| `x0_lambdas` | 把初始信息混合回来 | 防止深层网络丢失原始信息 |
-| `value_embeds` | 额外注入的"知识向量" | ResFormer 风格，像专家建议 |
-| `Block×12` | 12层"思考单元" | 逐层理解语义，每层包含注意力+MLP |
-
-**Block 内部结构**（每层都执行）：
-```
-输入 x
-  ├── norm(x) 归一化
-  ├── attention(norm(x)) → 注意力机制：让词知道其他词在说什么
-  ├── x = x + attention_output  残差连接
-  ├── norm(x) 归一化
-  ├── MLP(norm(x)) → 前馈网络：非线性变换
-  └── x = x + MLP_output  残差连接
-```
-
-#### 步骤 5：Backout 中间层（行 463-464）
-
-```python
-if x_backout is not None:
-    x = x - self.backout_lambda.to(x.dtype) * x_backout
-```
-
-**组件：`backout_lambda`**
-- **通俗理解**：去掉中间层的"低级特征"，像"纠错"
-- **工作**：在第 6 层（n_layer//2）保存中间结果，最后减去
-- **类比**：写完初稿后，回过头来删除拼写错误和格式问题
-
-#### 步骤 6：预测下一个词（行 467-472）
-
-```python
-x = norm(x)
-logits = self.lm_head(x)                    # 转成词表概率
-logits = softcap * torch.tanh(logits / softcap)  # 裁剪到 [-15, 15]
-```
-
-**组件：`lm_head`**
-- **通俗理解**：把处理后的向量转成词表概率，像"决策者"
-- **工作**：n_embd 维向量 → vocab_size 维 logits
-- **输出**：每个词表中词的得分，经过 softcap 裁剪防止数值爆炸
-
-### 1.3 前向传播流程总览
-
-```
-输入: "走进森林"
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 1. wte: "走进森林" → [0.1, 0.3, ...] × 4                    │
-│    翻译员：把文字转成数字向量                                 │
-└─────────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 2. smear: 混合前一个 token 的信息                            │
-│    "林" = "林" + 0.3 × "森"                                  │
-│    上下文线索：让每个词知道前一个词                           │
-└─────────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 3-5. Block×12: 12 轮深度思考                                │
-│    ┌────────────────────────────────────────────────────┐   │
-│    │ 第1层：残差混合 + 注意力 + MLP                      │   │
-│    │ 第2层：残差混合 + 注意力 + MLP                      │   │
-│    │ ...                                                │   │
-│    │ 第6层：同时保存 x_backout（用于 backout）           │   │
-│    │ ...                                                │   │
-│    │ 第12层：最终表示                                    │   │
-│    └────────────────────────────────────────────────────┘   │
-│    12个大脑区域：逐层理解语义                                 │
-└─────────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 6. backout: 减去中间层残差，去掉低级特征                      │
-│    纠错：删除拼写、格式等低级错误                             │
-└─────────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 7. lm_head: 转成词表概率                                    │
-│    决策者：输出 → "发现"(0.7), "遇到"(0.2), "看到"(0.1)     │
-└─────────────────────────────────────────────────────────────┘
-        │
-        ▼
-输出: 下一个词的概率分布
-```
-
-### 1.4 参数计算（默认配置约 85M~95M）
-
-以 `n_embd=768, n_layer=12, n_head=6, vocab_size=32768` 为例：
-
-| 组件 | 计算公式 | 参数量 |
-|------|----------|--------|
-| Token Embedding (wte) | vocab_size × n_embd | ≈ 25.2M |
-| LM Head | n_embd × vocab_size | ≈ 25.2M |
-| 每层 Attention | 3 × n_embd × (n_head + 2×n_kv_head) × head_dim | ≈ 1.8M |
-| 每层 MLP | 2 × 4×n_embd² | ≈ 4.8M |
-| 12层 Block 合计 | 12 × 7.4M | ≈ 88.8M |
-| **总计** | 25.2 + 25.2 + 88.8 | **≈ 139M** |
-
----
-
-## 2. Token Embedding 层
-
-Token Embedding 层负责把文字转换成数字向量，是模型处理文本的入口和出口。本节按数据流向组织：
-
-```
-Token ID ──wte──► [batch, seq, n_embd] ──Block×12──► [batch, seq, n_embd] ──lm_head──► [batch, seq, vocab_size]
-```
-
-### 2.1 Embedding 维度（n_embd）
-
-**n_embd 是 Token Embedding 的核心配置参数**，它决定了：
-- wte 的输出向量维度
-- lm_head 的输入向量维度
-- 每层 Block 的隐藏层维度
-- 所有注意力计算的向量长度
-
-```python
-# 每个 token 被表示为一个 n_embd 维的向量
-n_embd = 768  # "学习" → [0.1, 0.5, ..., 0.2]  # 768 个数字
-```
-
-| n_embd | 模型容量 | 表达能力 |
-|--------|----------|----------|
-| 256 | 小 | 较弱 |
-| 768 | 中 | 中等（nanochat 默认） |
-| 4096 | 大 | 强（如 LLaMA-2 7B） |
-
-### 2.2 wte：输入 Embedding
-
-**作用**：把 token ID（文字的数字编号）转成 n_embd 维向量
-
-**什么是 Token ID？**
-
-Token ID = 文字的数字编号。计算机只能处理数字，需要把文字转换成数字：
-
-```
-"走进森林"
-      │
-      ▼ 分词（Tokenizer）
-["走", "进", "森林"]
-      │
-      ▼ 查表（Vocab）
-[1024, 3345, 876]  ← 每个词对应一个数字编号
-```
-
-**为什么需要 Token ID？**
-
-| 问题 | 答案 |
+| 单词 | 含义 |
 |------|------|
-| "走进森林"计算机认识吗？ | ❌ 不认识，计算机只认数字 |
-| Token ID 从哪来？ | 分词器（Tokenizer）查词典得到 |
-| Token 是什么？ | 文本的最小单位（字、词、或子词） |
+| **Generative（生成式）** | 模型能一个词一个词地“写”出文本 |
+| **Pre-trained（预训练）** | 先在大量无标注文本上学习通用能力，再做具体任务 |
+| **Transformer** | 一种基于注意力机制的神经网络结构 |
 
-**Token 的粒度**：
+### 1.3 训练和推理的区别
 
-| 粒度 | 例子 | 特点 |
-|------|------|------|
-| **字级别** | "走", "进", "森", "林" | 简单，但词会被拆散 |
-| **词级别** | "走进", "森林" | 语义完整，但词表大 |
-| **子词级别** | "森林", "林" | 平衡效率与语义（常用） |
+| 阶段 | 做什么 | 是否需要前向传播 | 是否需要反向传播 |
+|------|--------|------------------|------------------|
+| **训练** | 看大量句子，学习预测下一个词 | ✅ | ✅ |
+| **推理/生成** | 给定开头，让它续写 | ✅ | ❌ |
 
-**一句话**：Token ID 就是文字的"数字身份证"，每个词在词表中都有一个唯一编号。
-
-```python
-x = transformer.wte(idx)  # [batch, seq_len] → [batch, seq_len, n_embd]
-```
-
-**输入**：token ID（整数）
-**输出**：n_embd 维向量
-
-```
-"走进森林"
-    │
-    ▼ tokenizer
-[1024, 3345, 876]  ← token ID 列表
-    │
-    ▼ wte
-[[0.1, 0.3, ..., 0.2],   ← 每个 ID 对应一个 n_embd 维向量
- [0.2, 0.1, ..., 0.4],
- [0.5, 0.2, ..., 0.1]]
-```
-
-### 2.2.1 中间处理：Block×12
-
-wte 输出的向量需要经过 **12 层 Transformer Block** 的深度处理，才能真正理解语义。
-
-**什么是 Block？**
-
-Block 是 Transformer 的核心处理单元，每层 Block 包含：
-- **注意力机制 (Attention)**：让每个词知道其他词在说什么
-- **前馈网络 (MLP)**：非线性变换，提取更深层的特征
-
-```
-wte 输出: [[0.1, ...], [0.2, ...], [0.5, ...]]  ← 只是简单的字向量
-                │           │           │
-                ▼           ▼           ▼
-         ┌─────────────────────────────────┐
-         │     Block×12：12层深度理解        │
-         │  - 第1层：理解"森林"是自然环境     │
-         │  - 第2层：理解"走进"是动作         │
-         │  - ...                           │
-         │  - 第12层：理解完整语义            │
-         └─────────────────────────────────┘
-                │           │           │
-                ▼           ▼           ▼
-Block 输出: [[0.8, ...], [0.3, ...], [0.9, ...]]  ← 真正的语义向量
-```
-
-**Block 能解决什么问题？**
-
-| 问题 | 例子 | Block 如何解决 |
-|------|------|---------------|
-| 指代消解 | "他喜欢苹果" → 谁是"他"？"苹果"是什么？ | 注意力让"他"看向前面的词 |
-| 一词多义 | "苹果很苹果" | 注意力根据上下文判断含义 |
-| 长距离依赖 | "住在[北京]的人喜欢[北京]的胡同" | 跨越距离建立联系 |
-
-**Block 的结构**（每层都执行）：
-
-```
-输入 x
-  ├── norm(x) 归一化
-  ├── attention(norm(x)) → 注意力：让词知道其他词在说什么
-  ├── x = x + attention_output  残差连接
-  ├── norm(x) 归一化
-  ├── MLP(norm(x)) → 前馈网络：非线性变换
-  └── x = x + MLP_output  残差连接
-```
-
-**一句话**：Block 是模型的"大脑"，12 层 Block 让模型能够逐层深入理解文本的语义。
-
-### 2.3 lm_head：输出层
-
-**作用**：把 Block 处理后的语义向量转换成**每个词的可能性得分**，用于预测下一个词
-
-```python
-logits = lm_head(norm(x))  # [batch, seq_len, n_embd] → [batch, seq_len, vocab_size]
-```
-
-**输入**：n_embd 维向量（Block 处理后的结果）
-**输出**：vocab_size 维 logits（每个词的原始得分）
-
-#### 为什么需要这个转换？
-
-语言模型的任务是：**给定前文，预测下一个词**。
-
-```
-"小明走进__"
-    │
-    ├── 需要预测的候选词：森林、房间、学校、...
-    └── 哪个词最合理？需要给每个词打分
-```
-
-lm_head 就是那个"打分器"：
-- 输入：模型对"小明走进"的理解（n_embd 向量）
-- 输出：每个词表中词的得分（vocab_size 维向量）
-
-```
-[0.1, 0.3, ..., 0.2]  ← 模型对上下文的理解（n_embd=768）
-    │
-    ▼ lm_head（一个线性变换：y = Wx + b）
-[3.2, 1.5, -2.1, ..., 0.8]  ← 每个词的原始得分（vocab_size=32768）
-     ↑     ↑        ↑
-   "森林" "房间"   "学校"
-   得分最高      得分较低
-```
-
-#### 什么是 logits？
-
-**logits = 模型的"原始打分"**
-
-lm_head 输出的不是概率，而是一串原始分数（logits）：
-
-```
-lm_head 输出: [3.2, 1.5, -2.1, ..., 0.8]
-                ↑    ↑     ↑        ↑
-              得分  得分  得分     得分
-               │     │     │        │
-              森林  房间  学校    苹果
-              
-这些就是 logits：模型对每个词的"喜好程度"
-```
-
-**为什么叫 logits？**
-
-| 特点 | 说明 |
-|------|------|
-| **可以是任意实数** | 3.2、1.5、-2.1、999、-100... 都可以 |
-| **没有限制范围** | 不是 [0,1]，也不要求和为 1 |
-| **相对大小有意义** | 3.2 > 1.5，所以"森林"比"房间"更可能 |
-
-**logits 不是概率，但可以通过 softmax 转成概率**：
-
-```
-logits:  [3.2, 1.5, -2.1]
-             │     │     │
-             ▼     ▼     ▼
-         softmax
-             │     │     │
-             ▼     ▼     ▼
-概率:    [0.85, 0.14, 0.01]  ← 每个词被选中的可能性（0~1之间，和为1）
-            ↑     ↑     ↑
-          森林   房间   学校
-          最可能        最不可能
-```
-
-**类比**：logits 像考试分数，概率像排名百分比
-
-```
-考试得分 (logits):
-  数学: 95分
-  语文: 88分
-  英语: 72分
-  
-排名百分比 (概率):
-  数学: 95%  ← 最可能选数学
-  语文: 4%
-  英语: 1%
-```
-
-#### logits 和概率的区别
-
-| 概念 | 说明 | 例子 |
-|------|------|------|
-| **logits** | 原始得分，未归一化，可以是任意实数 | [3.2, 1.5, -2.1] |
-| **概率** | 经过 softmax 归一化后的值，范围 [0,1]，和为 1 | [0.85, 0.14, 0.01] |
-
-```
-logits: [3.2, 1.5, -2.1]
-          │
-          ▼ softmax
-概率:   [0.85, 0.14, 0.01]  ← 所有概率之和 = 1
-           ↑     ↑     ↑
-         "森林" "房间" "学校"
-```
-
-**为什么用 logits 而不是直接输出概率？**
-1. **数值稳定性**：softmax 对大数敏感，logits 更适合数值计算
-2. **训练友好**：交叉熵损失可以直接用 logits 计算
-3. **模型表达**：logits 的相对大小更重要，绝对值不直接代表概率
-
-#### 后续处理
-
-lm_head 输出的 logits 还会经过两个步骤：
-
-```python
-# 1. Softcap 裁剪：防止数值爆炸
-softcap = 15
-logits = softcap * torch.tanh(logits / softcap)  # 裁剪到 [-15, 15]
-
-# 2. Softmax + 交叉熵：在损失计算时进行
-loss = F.cross_entropy(logits, targets)  # 自动 softmax + 计算损失
-```
-
-### 2.4 输入与输出的对应关系
-
-```
-         ┌─────────────────────────────────────────────────────────┐
-         │                      模型前向传播                         │
-         └─────────────────────────────────────────────────────────┘
-
-Token ID ──wte──► n_embd向量 ──Block×12──► n_embd向量 ──lm_head──► 词表概率
-              ▲                           │                           │
-              │                           │                           │
-         输入维度                          │                           │
-         由token数                          │                           │
-         决定                               │                           │
-                                            │                           │
-                               n_embd是统一的隐藏层维度                  │
-                               wte的输出 = lm_head的输入                │
-```
-
-**nanochat 的设计**：
-
-| 对比项 | GPT-2 | nanochat |
-|--------|-------|----------|
-| wte 和 lm_head | 共享权重（tied weights） | 独立初始化（untied weights） |
-| 优势 | 节省参数量 | 各自可以更专业地学习 |
-
-```python
-# nanochat 的独立初始化
-transformer.wte   = nn.Embedding(vocab_size, n_embd)  # 词→向量
-lm_head           = nn.Linear(n_embd, vocab_size, bias=False)  # 向量→词
-```
+前向传播：数据从输入一层层流到输出，得到结果。
+反向传播：根据预测结果和真实答案的差距，从后往前算每个参数该怎么调整。
 
 ---
 
-## 3. Block 层：注意力机制
+## 2. 数据流总览：从一句话到下一个词
 
-### 3.1 注意力在 Block 中的角色
+我们先把整个流程用一句话串起来，后面再拆开每一站。
 
-每层 Block 包含两个核心组件：
-
+```text
+文字句子
+  │
+  ▼ 分词器（Tokenizer，不在 gpt.py 里）
+Token ID 序列 [1024, 3345, 876, ...]
+  │
+  ▼ wte（Token Embedding）
+向量序列 [batch, seq_len, n_embd]
+  │
+  ▼ RMSNorm 归一化
+数值稳定的向量
+  │
+  ▼ Smear
+混合前一个 token 的信息
+  │
+  ▼ 12 层 Transformer Block
+逐层理解的语义向量
+  │
+  ▼ Backout
+减去中间层的低级特征
+  │
+  ▼ RMSNorm + LM Head
+每个词的得分 logits [batch, seq_len, vocab_size]
+  │
+  ▼ Softcap + Softmax
+概率分布，采样得到下一个词
 ```
-Block
-├── CausalSelfAttention  ← 注意力机制（核心）
-└── MLP                 ← 前馈网络
+
+`gpt.py` 里最重要的函数就是 `GPT.forward()`（第 416 行开始），上面的每一步都在里面。
+
+---
+
+## 3. Step 0：Token、Token ID 与 Embedding——把文字变成向量
+
+### 3.1 为什么计算机要先做“分词”？
+
+模型不认识汉字，只认识数字。所以第一步要把句子切成小块，每块对应一个词表里的编号。
+
+```text
+句子：今天天气真好
+  │
+  ▼ 分词
+["今天", "天气", "真", "好"]
+  │
+  ▼ 查词表（Vocab）
+[1024, 3345, 876, 2190]
 ```
+
+这些编号就叫 **Token ID**。词表大小 `vocab_size=32768`，表示模型一共认识 32768 种不同的 token。
+
+> 注意：`gpt.py` 本身不管分词，它接收的是已经分好词的 `idx`（一个整数张量）。分词在 `nanochat/tokenizer.py` 里做。
+
+### 3.2 Embedding：从整数到向量
+
+一个整数本身没有语义。比如 1024 和 1025 在数值上差 1，但可能完全没关系。所以我们需要一个“翻译表”，把每个 token ID 翻译成一个稠密向量。
+
+这个翻译表就是 `transformer.wte`：
+
+```python
+self.transformer = nn.ModuleDict({
+    "wte": nn.Embedding(padded_vocab_size, config.n_embd),
+    ...
+})
+```
+
+输入形状：`[batch, seq_len]`（一批句子，每个句子由 token ID 组成）
+输出形状：`[batch, seq_len, n_embd]`（每个 token 变成一个 n_embd 维向量）
+
+`n_embd=768` 是默认配置，所以每个 token 被表示成 768 个浮点数。
+
+```python
+x = self.transformer.wte(idx)  # [B, T] -> [B, T, C]
+```
+
+### 3.3 为什么需要 Embedding 层，而不是直接把整数喂给神经网络？
+
+神经网络对数字大小敏感。如果你把“猫=1000，狗=1001”直接当数值输入，模型可能会误以为狗比猫“大 1”。
+
+Embedding 做的是把每个整数映射到一个向量空间里的点。训练过程中，语义相近的词（比如“国王”和“女王”）会靠得很近，这就是 Embedding 的魔力。
+
+### 3.4 `padded_vocab_size` 是什么？
+
+代码里不是直接用 `vocab_size`，而是先 padding 到 64 的倍数：
+
+```python
+padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
+```
+
+原因：GPU 的矩阵乘法对特定尺寸更高效（Tensor Core 喜欢对齐）。输出时会把多出来的 padding 切掉：
+
+```python
+logits = logits[..., :self.config.vocab_size]
+```
+
+所以这不影响模型效果，只是性能优化。
+
+---
+
+## 4. Step 1：RMSNorm 归一化——让数值不要太“疯”
+
+### 4.1 什么是归一化？
+
+想象一堆数字，有的很大，有的很小。神经网络一层一层乘矩阵，数值容易越来越大或越来越小，导致训练不稳定。
+
+**归一化就是把一组数字按比例缩放到合适的范围，让它们大小差不多。**
+
+### 4.2 LayerNorm vs RMSNorm
+
+常见的 LayerNorm 会做两步：
+1. 减均值
+2. 除以标准差
+
+RMSNorm 更简单，只做第二步：
+
+```python
+def norm(x):
+    return F.rms_norm(x, (x.size(-1),))
+```
+
+它用“均方根”代替标准差，省去了减均值的操作。实践中效果差不多，但更快更省显存。
+
+### 4.3 为什么放在每个 Block 前面？
 
 ```python
 class Block(nn.Module):
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)  # 注意力
-        x = x + self.mlp(norm(x))                                        # MLP
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        x = x + self.mlp(norm(x))
         return x
 ```
 
-**注意力机制的作用**：
-1. **计算词与词之间的关系**：让每个词知道其他词在说什么
-2. **信息传递**：解决"他"指代谁、"它"是什么等问题
-3. **上下文聚合**：把分散的相关信息聚集到每个词上
+这种结构叫 **Pre-Norm**：先归一化，再进注意力/MLP。它比 Post-Norm 更稳定，能让深层模型训练起来不那么容易炸。
 
-### 3.2 Q/K/V 概念
+---
 
-```
-Query（查询）: "我想找关于机器学习的书"
-Key（键）:     每本书的分类标签
-Value（值）:   书的实际内容
+## 5. Step 2：Smear——让模型偷偷看一眼前一个词
 
-注意力机制：用 Query 去查询所有 Key，找到最相关的书，然后读取 Value。
-```
+### 5.1 为什么需要 Smear？
 
-### 3.3 点积（Dot Product）
+注意力机制很强，但它需要多层叠加才能建立词与词之间的联系。Smear 是一个很便宜的“捷径”：直接把前一个 token 的 embedding 混进当前 token。
 
-点积是向量之间的一种运算：`a·b = a1*b1 + a2*b2 + ... + an*bn`
-
-```
-点积 > 0：向量方向相近（相似）
-点积 = 0：向量垂直（无关）
-点积 < 0：向量方向相反（相反）
+```text
+位置 0：今
+位置 1：天  ← 把“今”的信息混一点进来
+位置 2：气  ← 把“天”的信息混一点进来
 ```
 
-**为什么用点积衡量相似度？**
-- 计算简单，GPU 高效并行
-- 几何直觉：点积越大越"相似"
-- 可学习：通过训练自动调整
+这有点像 bigram（二元语法）模型：看到“今”后面容易接“天”。
 
-### 3.4 注意力公式
-
-```
-Attention(Q, K, V) = softmax(QK^T / √d_k) × V
-```
-
-**四步拆解**：
+### 5.2 代码实现
 
 ```python
-# 第一步：计算相似度
-scores = Q @ K.T  # 每个词和其他所有词的关联程度
-
-# 第二步：缩放（防止 softmax 饱和）
-scores = scores / √d_k
-
-# 第三步：Softmax 归一化
-weights = softmax(scores, dim=-1)  # softmax(x_i) = exp(x_i) / Σ exp(x_j)
-
-# 第四步：加权求和
-output = weights @ V  # 每个词的表示 = 所有词的 Value 加权和
+# 训练时
+if kv_cache is None:
+    gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+    x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
 ```
 
-### 3.5 自注意力（Self-Attention）
+拆解：
+- `x[:, :-1]`：整段序列往前挪一位，变成“前一个词的向量”
+- `self.smear_gate(x[:, 1:, :24])`：只看前 24 维，学一个“混合比例”
+- `sigmoid`：把比例压到 0~1 之间
+- `self.smear_lambda`：整体缩放这个信号的大小
+- 最后用 `torch.cat` 把第一个位置（没有前一个词）原样拼回去
 
-自注意力让序列自己和自己比较：
+### 5.3 为什么只看前 24 维？
 
-```
-输入: "我想学习机器学习"
-        ↓
-每个词都同时是 Query、Key、Value
-        ↓
-"学习" 作为 Query，去问 "机器"、"学习"、"我"、"想"
-        ↓
-找到最相关的词，加权求和
-        ↓
-输出: "学习"的新表示（融合了上下文）
-```
+这是一个设计选择。前 24 维作为“low-level”信号通道，专门用来传递相邻 token 的位置/局部信息，剩下的维度保留原始语义。这样 Smear 不会干扰深层语义。
 
-**自注意力能解决什么问题？**
+### 5.4 推理时怎么办？
 
-1. **长距离依赖**：直接计算"他"和"小明"的关联，解决指代问题
-2. **上下文理解**：让"苹果"参考周围词确定具体含义
-3. **并行计算**：所有位置可以同时计算
-4. **信息聚合**：把分散的相关信息聚集到一起
+推理是一个词一个词生成的，没有“后一个位置”。所以用 KV Cache 里保存的 `prev_embedding`：
 
-### 3.6 注意力机制 vs 自注意力机制
-
-| 对比项 | 注意力机制 | 自注意力机制 |
-|--------|-----------|-------------|
-| Q/K/V 来源 | 可以不同（跨语言、跨模态） | 必须相同（同一序列） |
-| 应用场景 | 机器翻译、图像描述 | 语言模型内部、Transformer |
-| 经典例子 | Seq2Seq 的 encoder-decoder attention | Transformer 的 multi-head self-attention |
-
-```
-注意力机制（Attention）
-    ├── 跨序列注意力：Query 来自序列 A，Key/Value 来自序列 B
-    └── 自注意力（Self-Attention）：Query、Key、Value 都来自序列 A
-```
-
-### 3.7 因果注意力（Causal Attention）
-
-语言模型只能看前面的词，不能偷看后面的答案：
-
-```
-输入: "今天天气真好"
-位置:  0   1   2   3   4
-
-"天" (位置1) 只能看 "今" (位置0)     ✓
-"气" (位置2) 只能看 "今、天"        ✓
-"好" (位置4) 只能看 "今、天、气、"   ✓
-              不能看位置5,6,7...       ✗
+```python
+x_pre_smear = kv_cache.prev_embedding
+kv_cache.prev_embedding = x[:, -1:, :]
+# ... 用 x_pre_smear 作为前一个词的向量
 ```
 
 ---
 
-## 4. Block 层：Multi-Head 与 GQA
+## 6. Step 3：保存 x0——防止模型“忘了初心”
 
-### 4.1 Multi-Head（多头注意力）
+### 6.1 深层网络的问题
 
-把 embedding 维度分成多个头：
+Transformer 堆很多层后，每一层都在前一层的输出上做变换。经过 12 层后，最初的 token 信息可能被“稀释”或“扭曲”。
+
+### 6.2 把最初的信息带回来
 
 ```python
-n_embd = 768      # embedding 总维度
-n_head = 6        # 头的数量
-head_dim = 128    # 每个头的维度 = n_embd / n_head = 768 / 6 = 128
+x0 = x  # 保存经过 Smear 后的初始embedding
 ```
 
-**为什么需要多头？**
+然后在每一层 Block 之前，都把当前状态 `x` 和初始状态 `x0` 按学习到的比例混合：
 
-一个注意力头只能学到一种类型的模式。多头让不同头学习不同关系：
-
-```
-"学习" 被 6 个头处理：
-Head 1: 学习语法关系
-Head 2: 学习语义关系
-Head 3: 学习位置关系
-...
-所有头的结果拼接，得到更丰富的表示
+```python
+x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
 ```
 
-**头数选择**：n_embd 必须能被 n_head 整除
+| 系数 | 作用 |
+|------|------|
+| `resid_lambdas[i]` | 当前层状态保留多少 |
+| `x0_lambdas[i]` | 最初embedding混回多少 |
+
+初始化时：
+- `resid_lambdas` 从 1.15 逐渐降到 1.05
+- `x0_lambdas` 从 0.20 逐渐降到 0.05
+
+含义：浅层多保留当前状态，但也多回顾初始信息；深层慢慢减少初始信息的混合。
+
+---
+
+## 7. Step 4：Transformer Block——模型的“大脑”
+
+每一层 Block 是 GPT 的核心计算单元：
+
+```python
+class Block(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.attn = CausalSelfAttention(config, layer_idx)
+        self.mlp = MLP(config)
+
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        x = x + self.mlp(norm(x))
+        return x
+```
+
+每层做两件事：
+1. **注意力（Attention）**：看看上下文其他词，更新自己的理解
+2. **MLP**：做非线性变换，提取更抽象特征
+
+两者都有 **残差连接**（`x + ...`）：保留原始输入，只叠加变化量。这让深层网络训练更稳定。
+
+### 7.1 为什么需要注意力？
+
+考虑这个句子：
+
+```text
+小明把书包放在桌子上，然后他开始写作业。
+```
+
+看到“他”时，模型需要知道“他”指的是“小明”。这个信息在很远的前面。
+
+传统 RNN/LSTM 需要一步步传过去，容易丢失。注意力机制让“他”直接和“小明”建立联系，不管距离多远。
+
+### 7.2 Query / Key / Value 是什么？
+
+这是注意力机制的三个角色，可以用图书馆类比：
+
+| 角色 | 类比 | 作用 |
+|------|------|------|
+| **Query** | 你问的问题 | “我想找和当前词相关的信息” |
+| **Key** | 书的标签 | 每个词提供的“主题标签” |
+| **Value** | 书的内容 | 每个词实际携带的信息 |
+
+计算过程：
+1. 用 Query 和所有 Key 算相似度
+2. 相似度高的 Key 对应的 Value 就多拿一些
+3. 最后把 Value 加权求和，作为当前词的新表示
+
+### 7.3 自注意力：一句话自己问自己
+
+在 GPT 里，Query、Key、Value 都来自同一个句子，所以叫 **Self-Attention（自注意力）**。
+
+```python
+q = self.c_q(x)  # 从 x 生成 Query
+k = self.c_k(x)  # 从 x 生成 Key
+v = self.c_v(x)  # 从 x 生成 Value
+```
+
+`c_q`、`c_k`、`c_v` 都是线性层（没有 bias），作用是把同一个 `x` 投影成三种不同的“视角”。
+
+### 7.4 因果注意力：不能偷看后面的答案
+
+语言模型生成下一个词时，只能看前面的词，不能看后面的词。否则就是作弊。
+
+```text
+句子：今天天气真好
+预测“天”时，只能看“今”
+预测“气”时，只能看“今天”
+预测“好”时，只能看“今天天气真”
+```
+
+这叫 **Causal Attention（因果/因果掩码注意力）**，代码里由 Flash Attention 自动处理：
+
+```python
+y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+```
+
+`causal=True` 表示只关注当前位置及之前的 token。
+
+### 7.5 多头注意力：多双眼睛看不同关系
+
+一个注意力头只能捕捉一种关系。多个头并行，可以捕捉不同层面的模式：
 
 ```python
 n_embd = 768
-768 / 6 = 128   ✓  # 常用选择
-768 / 5 = 153.6 ✗  # 不是整数
+n_head = 6
+head_dim = n_embd // n_head  # 128
 ```
 
-**为什么 head_dim 通常是 128？**
-- 足够大，能捕捉足够的模式
-- 足够小，适合 GPU 并行计算
-- 128 是 2 的幂次，GPU 计算效率高
-
-### 4.2 MHA（Multi-Head Attention）
-
-标准 MHA 中，每个 Q/K/V 头数相同：
-
-```
-n_head = 6 时：6 个 Query 头 + 6 个 Key 头 + 6 个 Value 头
-推理时需要缓存 6+6 = 12 个向量序列
-```
-
-### 4.3 GQA（Group-Query Attention）
-
-当 `n_kv_head < n_head` 时，多个 Q 头共享同一个 K/V 头：
-
-```
-GQA (n_head=6, n_kv_head=2):
-  6个Q头（各自独立）
-  2个K头（每3个Q头共享1个）
-  2个V头（每3个Q头共享1个）
-  推理时只需缓存 2+2 = 4 个向量序列
-```
-
-**显存节省 3 倍！**
-
-### 4.4 如何启用
+每个头独立计算注意力，最后把结果拼起来：
 
 ```python
-# MHA（标准）
-config = GPTConfig(n_head=12, n_kv_head=12, n_embd=768)
-
-# GQA（分组查询注意力）
-config = GPTConfig(n_head=12, n_kv_head=4, n_embd=768)
+q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+# ... 注意力计算 ...
+y = y.contiguous().view(B, T, -1)  # 把头拼回一个向量
+y = self.c_proj(y)
 ```
 
-### 4.5 应用场景
+### 7.6 GQA：让推理更省显存
 
-| 模型 | n_head | n_kv_head | 类型 |
-|------|--------|-----------|------|
-| LLaMA-2 7B | 32 | 8 | GQA |
-| Mistral 7B | 8 | 1 | GQA |
-| Qwen 7B | 32 | 32 | MHA |
-| nanochat (默认) | 6 | 6 | MHA |
+标准多头注意力里，Query、Key、Value 的头数一样多。推理时为了加速，我们会缓存之前的 Key 和 Value（KV Cache），这很占显存。
 
----
+**Group-Query Attention（GQA）** 让多个 Query 头共享同一个 Key/Value 头：
 
-## 5. Block 层：RoPE 旋转位置编码
-
-### 5.1 为什么需要 RoPE？
-
-注意力机制本身不包含位置信息。传统方法（绝对位置）只能学到"位置1"，学不到"在位置2旁边"。
-
-### 5.2 RoPE 核心思想
-
-不是把位置信息加到向量上，而是旋转向量。
-
-```
-对于维度 (x1, x2)，旋转角度 θ：
-
-不同位置使用不同的旋转角度：
-  位置0: θ=0°      → [x1, x2]
-  位置1: θ=θ        → 旋转θ
-  位置2: θ=2θ       → 旋转2θ
+```python
+n_head = 6      # Query 头数
+n_kv_head = 2   # Key/Value 头数
 ```
 
-旋转后的点积只依赖于 (i-j)，即**相对位置**！模型能学到"前面2个位置"vs"前面1个位置"。
+这样每 3 个 Query 共享 1 个 Key 和 1 个 Value。缓存量减少到 1/3。
 
-### 5.3 代码实现
+代码里通过断言保证 `n_head % n_kv_head == 0`：
+
+```python
+assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+```
+
+默认配置 `n_head=6, n_kv_head=6`，此时就是标准 MHA（每个 Query 一个 KV）。
+
+### 7.7 RoPE 旋转位置编码：让模型知道“第几个词”
+
+#### 7.7.1 为什么需要位置编码？
+
+注意力机制本身对位置不敏感。你把句子顺序打乱，它算出来的注意力分数可能完全一样。但语言顺序很重要：
+
+```text
+"狗追猫" 和 "猫追狗" 意思完全不同
+```
+
+所以需要告诉模型每个词在句子中的位置。
+
+#### 7.7.2 传统绝对位置编码的问题
+
+早期做法是直接学一组位置向量（比如 position 0 对应向量 A，position 1 对应向量 B）。问题是：
+- 只能表示“我在第几个位置”
+- 很难泛化到比训练时更长的序列
+- 两个位置的“相对距离”不好学
+
+#### 7.7.3 RoPE 的思想
+
+**RoPE（Rotary Position Embedding，旋转位置编码）** 不直接加位置向量，而是把 Query 和 Key 向量按维度两两分组，每组做一个二维旋转。旋转角度和位置有关。
 
 ```python
 def apply_rotary_emb(x, cos, sin):
     d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    y1 = x1 * cos + x2 * (-sin)
-    y2 = x1 * sin + x2 * cos
+    x1, x2 = x[..., :d], x[..., d:]  # 把最后一维分成两半
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
 ```
 
-### 5.4 RoPE 的优势
+位置越远，旋转角度越大。神奇的是：旋转后的点积只和 **相对位置** 有关。
 
-| 对比项 | 绝对位置编码 | RoPE |
-|--------|-------------|------|
-| 表达能力 | 只知道"在哪" | 同时知道"在哪"和"相对距离" |
-| 外推能力 | 超出训练长度效果差 | 能处理超长序列 |
+也就是说，模型不需要死记硬背“位置 5 的向量是什么”，它只要学“距离为 2 的两个词有什么关系”。这让它更容易处理没见过的长序列。
 
----
+#### 7.7.4 预计算 cos/sin
 
-## 6. Block 层：MLP 与 Block 结构
+旋转角度只和位置、维度有关，和输入无关，所以可以预计算：
 
-### 6.1 MLP（ReLU² 激活）
+```python
+cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+self.register_buffer("cos", cos, persistent=False)
+self.register_buffer("sin", sin, persistent=False)
+```
 
-使用 `(ReLU(x))²` 而非标准的 GELU 或 SwiGLU：
+`persistent=False` 表示不存进 checkpoint，因为每次初始化都能重新算。
+
+`_precompute_rotary_embeddings` 里用 `base=100000` 控制旋转频率：
+
+```python
+channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+inv_freq = 1.0 / (base ** (channel_range / head_dim))
+```
+
+维度越高的分组，旋转越慢；维度越低的分组，旋转越快。高频维度捕捉短距离关系，低频维度捕捉长距离关系。
+
+### 7.8 QK Norm + 1.2 缩放：让注意力更聚焦
+
+#### 7.8.1 为什么要对 Q 和 K 做 Norm？
+
+点积注意力里，如果 Q 和 K 的数值尺度不稳定，softmax 容易“饱和”——某个分数特别大，其他都接近 0，梯度就消失了。
+
+对 Q 和 K 分别做 RMSNorm，可以让它们的尺度稳定：
+
+```python
+q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+q, k = norm(q), norm(k)  # QK norm
+```
+
+#### 7.8.2 1.2 缩放是什么？
+
+```python
+q = q * 1.2
+k = k * 1.2
+```
+
+在 norm 之后再整体放大 1.2 倍，让点积结果更大，注意力分布更“尖锐”（sharp）。这样模型更敢于聚焦到真正重要的词上。
+
+> 代码注释也写了这是 TODO，作者还没完全调优这个数值。
+
+### 7.9 Value Embeddings：给注意力加点“外部知识”
+
+#### 7.9.1 什么是 Value Embeddings？
+
+标准注意力里，Value 是从输入 `x` 线性投影出来的。 nanochat 额外加了一个可学习的 Value Embedding 表：
+
+```python
+self.value_embeds = nn.ModuleDict({
+    str(i): nn.Embedding(padded_vocab_size, kv_dim)
+    for i in range(config.n_layer) if has_ve(i, config.n_layer)
+})
+```
+
+每个 token 除了普通 Embedding `wte`，还有一个专门给 Value 用的 Embedding。这个 Value Embedding 会通过一个门控机制混进注意力里的 `v`：
+
+```python
+if ve is not None:
+    ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+    gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+    v = v + gate.unsqueeze(-1) * ve
+```
+
+#### 7.9.2 为什么这么做？
+
+可以把它理解为“专家建议通道”。普通 Embedding 主要负责语义，Value Embedding 可以专门学习对注意力有用的一些额外信息。
+
+#### 7.9.3 为什么是隔层使用？
+
+```python
+def has_ve(layer_idx, n_layer):
+    return layer_idx % 2 == (n_layer - 1) % 2
+```
+
+这个函数决定哪些层用 Value Embedding。默认 `n_layer=12` 时，第 1, 3, 5, 7, 9, 11 层用（从 0 开始数的话是 0, 2, 4, 6, 8, 10）。
+
+隔层使用是为了控制参数量和计算量。最后一层总是包含 Value Embedding，因为那是最终输出前的重要层。
+
+### 7.10 MLP：非线性变换，提取更抽象特征
 
 ```python
 class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
+
     def forward(self, x):
-        x = self.c_fc(x)           # n_embd → 4*n_embd
-        x = F.relu(x).square()      # ReLU² 激活函数
-        x = self.c_proj(x)         # 4*n_embd → n_embd
+        x = self.c_fc(x)
+        x = F.relu(x).square()
+        x = self.c_proj(x)
         return x
 ```
 
-### 6.2 Block 结构
+结构：
+1. `c_fc`：把 `n_embd` 映射到 `4*n_embd`
+2. 激活函数：`relu(x).square()`，也就是 ReLU²
+3. `c_proj`：把 `4*n_embd` 映射回 `n_embd`
 
-标准的 Pre-Norm 结构，使用 **RMSNorm**（无可学习参数）：
+#### 7.10.1 为什么需要 MLP？
+
+注意力做的是“加权求和”，本质上是线性的。MLP 引入非线性，让模型能学到更复杂的函数。
+
+可以粗略理解：
+- **注意力**：收集上下文信息
+- **MLP**：对收集到的信息做深加工
+
+#### 7.10.2 为什么是 ReLU²？
+
+常见选择有 GELU、SwiGLU 等。nanochat 用 `relu(x).square()`，因为它：
+- 计算非常简单
+- 在论文和实践中有不错的表现
+- 平滑且非负
 
 ```python
-class Block(nn.Module):
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)  # 注意力残差
-        x = x + self.mlp(norm(x))                                        # MLP残差
-        return x
-```
-
-### 6.3注意力 + MLP 的配合
-
-```
-输入 x → 注意力层（聚合上下文）→ MLP层（非线性变换）→ 输出
+x = F.relu(x).square()
 ```
 
 ---
 
-## 7. 前向传播流程
+## 8. Step 5：Backout——把低级特征“减掉”
+
+### 8.1 什么是 Backout？
+
+在 Transformer 中间某一层（默认是 `n_layer // 2`），保存当前的残差状态 `x_backout`。最后输出前，从最终表示里减去一部分 `x_backout`：
 
 ```python
-def forward(self, idx, targets=None, kv_cache=None):
-    # ① Token Embedding
-    x = self.transformer.wte(idx)
-    x = norm(x)
+backout_layer = n_layer // 2  # 第6层
+x_backout = None
+for i, block in enumerate(self.transformer.h):
+    ...
+    if i == backout_layer:
+        x_backout = x
 
-    # ② Smear：混合前一个token的embedding
-    gate = smear_lambda * sigmoid(smear_gate(x[:, 1:, :24]))
-    x = cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]])
+if x_backout is not None:
+    x = x - self.backout_lambda.to(x.dtype) * x_backout
+```
 
-    # ③ 通过12层Block
-    x0 = x  # 保存初始embedding
-    for i, block in enumerate(self.transformer.h):
-        x = resid_lambdas[i] * x + x0_lambdas[i] * x0  # 可学习的残差混合
-        ve = value_embeds[i](idx)
-        x = block(x, ve, cos_sin, window_size, kv_cache)
+### 8.2 为什么减去中间层？
 
-    # ④ Backout：减去中间层残差
-    x = x - backout_lambda * x_backout
+作者希望浅层学到的低级特征（拼写、局部模式等）不要过度影响最终的语义判断。通过减去中间层表示，可以让高层更专注于抽象语义。
 
-    # ⑤ LM Head
-    logits = lm_head(norm(x))
+### 8.3 `backout_lambda=0.2`
 
-    # ⑥ Softcap + 交叉熵损失
-    logits = softcap * tanh(logits / softcap)
-    loss = cross_entropy(logits, targets)
+不是完全减掉，而是减 20%。保留大部分信息，只抑制一部分。
+
+---
+
+## 9. Step 6：LM Head + Softcap——输出每个词的得分
+
+### 9.1 LM Head：把语义向量映射回词表
+
+```python
+self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
+```
+
+输入：`[B, T, n_embd]`
+输出：`[B, T, vocab_size]`
+
+每个位置都会输出词表里每个词的“原始得分”，也叫 **logits**。
+
+### 9.2 为什么 logits 不是概率？
+
+logits 可以是任意实数，没有约束。这样模型更容易学习。真正用的时候再 softmax 转成概率。
+
+```python
+# 训练时直接算交叉熵，内部会做 softmax
+loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+```
+
+### 9.3 Softcap：防止 logits 太大
+
+```python
+softcap = 15
+logits = logits.float()
+logits = softcap * torch.tanh(logits / softcap)
+```
+
+`tanh` 会把输入压到 `[-1, 1]` 之间，再乘以 15，所以 logits 被限制在 `[-15, 15]`。
+
+好处：防止某些词得分特别高，让训练更稳定。
+
+### 9.4 wte 和 lm_head 是独立的
+
+nanochat 里 `wte` 和 `lm_head` 不共享权重（untied）：
+
+```python
+self.transformer = nn.ModuleDict({
+    "wte": nn.Embedding(padded_vocab_size, config.n_embd),
+    ...
+})
+self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
+```
+
+GPT-2 是共享权重的（tied），nanochat 选择独立，让输入嵌入和输出投影各自优化。
+
+---
+
+## 10. 训练 vs 推理：KV Cache 是干嘛的？
+
+### 10.1 推理为什么慢？
+
+生成文本时，每次只能预测一个词：
+
+```text
+输入：[今天]
+输出：天
+输入：[今天，天]
+输出：气
+输入：[今天，天，气]
+输出：真
+...
+```
+
+每次输入都变长了，如果每次都重新算所有位置的 Key 和 Value，会非常浪费。
+
+### 10.2 KV Cache 的思想
+
+把之前算好的 Key 和 Value 存起来，下次只算新 token 的 Q/K/V，然后把新的 K/V 拼到缓存里。
+
+```python
+if kv_cache is None:
+    # 训练：一次性看完整序列
+    y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+else:
+    # 推理：复用缓存
+    k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+    y = flash_attn.flash_attn_with_kvcache(
+        q, k_cache, v_cache,
+        k=k, v=v,
+        cache_seqlens=kv_cache.cache_seqlens,
+        causal=True,
+        window_size=window_size,
+    )
+    if self.layer_idx == kv_cache.n_layers - 1:
+        kv_cache.advance(T)
+```
+
+`gpt.py` 本身不实现 KV Cache 的细节，它调用 `flash_attn_with_kvcache`。具体缓存逻辑在 `nanochat/engine.py` 里。
+
+### 10.3 训练时为什么不用 KV Cache？
+
+训练时一次性输入整个序列，直接做因果注意力更高效。KV Cache 主要是为了推理加速。
+
+---
+
+## 11. Sliding Window Attention：不是所有层都看全部上下文
+
+### 11.1 为什么有的层只看局部？
+
+注意力计算量和序列长度的平方成正比。如果所有层都看全部 2048 个 token，计算量很大。
+
+观察发现：浅层可能更多处理局部语法、词法，不需要看太远；深层需要理解全局语义，需要全上下文。
+
+### 11.2 `window_pattern` 配置
+
+```python
+window_pattern: str = "SSSL"
+```
+
+- `S` = Short：只看附近（约 1/4 上下文）
+- `L` = Long：看全部上下文
+
+模式会循环应用到各层，但**最后一层强制为 L**。
+
+```python
+def _compute_window_sizes(self, config):
+    pattern = config.window_pattern.upper()
+    long_window = config.sequence_len          # 2048
+    short_window = -(-long_window // 4 // 128) * 128  # 768
+    char_to_window = {
+        "L": (long_window, 0),
+        "S": (short_window, 0),
+    }
+    window_sizes = []
+    for layer_idx in range(config.n_layer):
+        char = pattern[layer_idx % len(pattern)]
+        window_sizes.append(char_to_window[char])
+    window_sizes[-1] = (long_window, 0)  # 最后一层强制全上下文
+    return window_sizes
+```
+
+默认 12 层 + "SSSL" 模式下，窗口大小为：
+
+```text
+Layer 0:  S (768)
+Layer 1:  S (768)
+Layer 2:  S (768)
+Layer 3:  L (2048)
+Layer 4:  S (768)
+Layer 5:  S (768)
+Layer 6:  S (768)
+Layer 7:  L (2048)
+Layer 8:  S (768)
+Layer 9:  S (768)
+Layer 10: S (768)
+Layer 11: L (2048)  # 强制
 ```
 
 ---
 
-## 8. nanochat 特殊设计
-
-### 8.1 Smear 层
-
-混合前一个 token 的 embedding（类似 bigram 信号）：
-
-```python
-gate = smear_lambda * sigmoid(smear_gate(x[:, 1:, :24]))
-x = cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]])
-```
-
-### 8.2 Backout 层
-
-减去中间层残差，去除低级特征（拼写、格式）：
-
-```python
-x = x - backout_lambda * x_backout
-```
-
-### 8.3 Value Embeddings
-
-ResFormer 风格：可学习的 value 表注入注意力：
-
-```python
-ve = value_embeds[i](idx)
-```
-
-### 8.4 可学习残差混合
-
-```python
-x = resid_lambdas[i] * x + x0_lambdas[i] * x0  # 可学习的残差混合
-```
-
-### 8.5 设计亮点汇总
-
-| 特性 | 说明 |
-|------|------|
-| **GQA** | 减少 KV cache，推理更快 |
-| **Sliding Window** | 浅层用滑动窗口，深层用全上下文 |
-| **Value Embeddings** | 可学习的 value 表注入注意力 |
-| **Smear** | 混合前 token embedding，bigram 信号 |
-| **Backout** | 减中间层残差，去除低级特征 |
-| **Pre-Norm + RMSNorm** | 无偏置，省显存，训练稳定 |
-| **ReLU²** | MLP 激活函数 |
-| **QK Norm + 1.2 缩放** | 让注意力更 sharp |
-| **Untied Weights** | wte 和 lm_head 独立初始化 |
-| **Softcap** | logits 裁剪到 [-15, 15]，防止数值爆炸 |
-
----
-
-## 9. GPTConfig 配置
-
-### 9.1 配置代码
+## 12. GPTConfig 配置参数解释
 
 ```python
 @dataclass
 class GPTConfig:
-    sequence_len: int = 2048      # 上下文窗口长度
+    sequence_len: int = 2048      # 最大序列长度
     vocab_size: int = 32768       # 词表大小
     n_layer: int = 12             # Transformer 层数
     n_head: int = 6               # Query 头数
-    n_kv_head: int = 6            # Key/Value 头数 (GQA)
+    n_kv_head: int = 6            # Key/Value 头数（=n_head 时为标准 MHA）
     n_embd: int = 768             # 隐藏层维度
     window_pattern: str = "SSSL"  # 滑动窗口模式
 ```
 
-### 9.2 参数详解
-
-| 参数 | 默认值 | 说明 |
+| 参数 | 默认值 | 含义 |
 |------|--------|------|
-| `sequence_len` | 2048 | 上下文窗口长度。超过会报错，同时用于预计算 RoPE 表。 |
-| `vocab_size` | 32768 | 词表大小，决定 `lm_head` 输出维度。 |
-| `n_layer` | 12 | Transformer Block 层数，越多越深。 |
-| `n_head` | 6 | Query 头数，`n_head * head_dim = n_embd`。 |
-| `n_kv_head` | 6 | Key/Value 头数，支持 GQA。当 `< n_head` 时多个 Q 共享同一 KV。 |
-| `n_embd` | 768 | 隐向量维度，决定模型宽度。 |
-| `window_pattern` | `"SSSL"` | 滑动窗口模式：`S`=短窗口，`L`=全上下文。最后层强制为 `L`。 |
-
-### 9.3 常见配置
-
-| 模型 | n_embd | n_head | head_dim |
-|------|--------|--------|----------|
-| nanochat 小模型 | 256 | 2 | 128 |
-| nanochat 默认 | 768 | 6 | 128 |
-| LLaMA-2 7B | 4096 | 32 | 128 |
-| GPT-3 | 12288 | 96 | 128 |
+| `sequence_len` | 2048 | 一次最多处理多少个 token，也是 RoPE 预计算长度 |
+| `vocab_size` | 32768 | 词表大小，决定输出维度 |
+| `n_layer` | 12 | 模型深度，层数越多越“深” |
+| `n_head` | 6 | 注意力 Query 头数 |
+| `n_kv_head` | 6 | 注意力 Key/Value 头数，小于 `n_head` 时启用 GQA |
+| `n_embd` | 768 | 模型宽度，每个 token 的向量维度 |
+| `window_pattern` | "SSSL" | 滑动窗口模式，S=短 L=长 |
 
 ---
 
-## 10. 权重初始化
+## 13. 权重初始化：模型一开始怎么“长”出来的
+
+神经网络训练前需要给参数赋初值。不好的初始化会让模型一开始就在瞎猜或梯度爆炸。
 
 ```python
-# Embedding: 高方差初始化
-wte:    normal(std=0.8)
-lm_head: normal(std=0.001)  # 很小，避免初期过度自信
+@torch.no_grad()
+def init_weights(self):
+    # 输入/输出嵌入
+    torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
+    torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
 
-# 注意力/MLP层: 均匀分布
-attn.c_q/k/v:  uniform(std=1/√n_embd)
-attn.c_proj:   zeros
-mlp.c_fc:      uniform(0.4×std)
-mlp.c_proj:    zeros
+    # 线性层用均匀分布，标准差约为 1/sqrt(n_embd)
+    n_embd = self.config.n_embd
+    s = 3**0.5 * n_embd**-0.5
+    for block in self.transformer.h:
+        torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
+        torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+        torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+        torch.nn.init.zeros_(block.attn.c_proj.weight)  # 输出投影初始化为0
+        torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)
+        torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
-# 可学习标量: 退火初始化
-resid_lambdas: 从1.15递减到1.05
-x0_lambdas:    从0.20递减到0.05
+    # 可学习标量
+    for i in range(n_layer):
+        self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
+        self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
+
+    torch.nn.init.zeros_(self.smear_lambda)
+    torch.nn.init.constant_(self.backout_lambda, 0.2)
+    torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
+
+    # Value embeddings 和 gate
+    for ve in self.value_embeds.values():
+        torch.nn.init.uniform_(ve.weight, -s, s)
+    for block in self.transformer.h:
+        if block.attn.ve_gate is not None:
+            torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
 ```
 
----
+### 13.1 关键设计
 
-## 11. 与 GPT-2 的对比
-
-| 对比项 | 标准 GPT-2 | nanochat |
-|--------|-----------|---------|
-| 位置编码 | 学习式绝对位置 | RoPE 旋转编码 |
-| 注意力 | MHA | **GQA** |
-| MLP激活 | GELU | **ReLU²** |
-| Norm | LayerNorm | **RMSNorm** (无参数) |
-| 注意力头 Norm | 无 | **QK Norm** |
-| 位置感知 | 仅注意力 | **Smear + RoPE** |
-| Token/Head | 共享权重 | **独立权重** |
-| 训练技巧 | 无 | Backout、Value Embeddings |
+| 参数 | 初始化方式 | 原因 |
+|------|-----------|------|
+| `wte` | normal(std=0.8) | Embedding 需要一定幅度 |
+| `lm_head` | normal(std=0.001) | 初始输出很“软”，避免一开始过度自信 |
+| `c_q/c_k/c_v` | uniform(±s) | 稳定注意力初值 |
+| `c_proj` | zeros | 残差分支初始为 0，相当于先不走这条支路 |
+| `c_fc` | uniform(±0.4s) | MLP 输入层缩小一点 |
+| `resid_lambdas` | 1.15 → 1.05 | 浅层残差强一点，深层弱一点 |
+| `x0_lambdas` | 0.20 → 0.05 | 浅层多回顾初始 embedding |
 
 ---
 
-## 下一步学习
+## 14. 参数数量估算
 
-这是从零重写的现代 Transformer 实现，集成了 2023-2024 年的多项训练技巧。接下来可以看：
+默认配置 `n_embd=768, n_layer=12, n_head=6, n_kv_head=6, vocab_size=32768`，实际用 `sum(p.numel())` 统计得到约 **286M** 参数。分布如下：
 
-- `nanochat/engine.py` — 理解 KV Cache 推理机制
-- `nanochat/common.py` — 工具函数
+| 组件 | 计算 | 参数量 |
+|------|------|--------|
+| Token Embedding (wte) | 32768 × 768 | ~25.2M |
+| LM Head | 768 × 32768 | ~25.2M |
+| 每层 Attention | c_q + c_k + c_v + c_proj | ~2.4M |
+| 每层 MLP | c_fc + c_proj | ~4.7M |
+| 每层 Block 合计 | Attention + MLP | ~7.1M |
+| 12 层 Block | 12 × 7.1M | ~85.0M |
+| Value Embeddings | 6 层 × 32768 × 768 | ~151.0M |
+| 可学习标量 + smear_gate | 可忽略 | ~0.01M |
+| **总计** | 上面相加 | **~286M** |
+
+### 14.1 为什么 Value Embeddings 占这么多？
+
+```python
+head_dim = config.n_embd // config.n_head  # 128
+kv_dim = config.n_kv_head * head_dim        # 6 * 128 = 768
+self.value_embeds = nn.ModuleDict({
+    str(i): nn.Embedding(padded_vocab_size, kv_dim)
+    for i in range(config.n_layer) if has_ve(i, config.n_layer)
+})
+```
+
+每个 Value Embedding 表的大小和普通词嵌入 `wte` 一样（`vocab_size × n_embd`）。默认 12 层里有 6 层启用 Value Embedding，所以光这一项就是 `6 × 25.2M ≈ 151M`。
+
+这就是为什么默认配置下参数量达到 286M，而不是原来文档里说的“85M~95M”——那个估计漏掉了 Value Embeddings。
+
+### 14.2 想控制参数量怎么办？
+
+- 减少 `n_kv_head`：KV 维度 `kv_dim = n_kv_head × head_dim` 会随之减小
+- 减少 `n_layer`：层数少了，Value Embedding 层数也会少
+- 禁用 Value Embeddings：需要改代码（把 `has_ve` 永远返回 False）
+- 减小 `vocab_size` 或 `n_embd`
+
+### 14.3 常用配置对比
+
+| 模型 | n_embd | n_head | n_kv_head | head_dim | 备注 |
+|------|--------|--------|-----------|----------|------|
+| nanochat 默认 | 768 | 6 | 6 | 128 | 含 VE 约 286M |
+| nanochat 小模型 | 256 | 2 | 2 | 128 | 规模大幅缩小 |
+| LLaMA-2 7B | 4096 | 32 | 8 | 128 | 标准 GQA |
+| GPT-3 | 12288 | 96 | 96 | 128 | 标准 MHA |
+
+---
+
+## 15. nanochat 与原版 GPT-2 的主要区别
+
+| 特性 | GPT-2 | nanochat |
+|------|-------|----------|
+| 位置编码 | 可学习绝对位置 | RoPE 旋转位置编码 |
+| 注意力 | 标准 MHA | 支持 GQA |
+| MLP 激活 | GELU | ReLU² |
+| 归一化 | LayerNorm | RMSNorm（无参数） |
+| Q/K Norm | 无 | 有 |
+| 残差连接 | 标准 | 可学习 `resid_lambdas` + `x0_lambdas` |
+| 特殊层 | 无 | Smear、Backout、Value Embeddings |
+| 输入/输出 Embedding | 共享权重 | 独立权重 |
+| 滑动窗口 | 无 | 有 |
+
+---
+
+## 16. 下一步看哪里
+
+- `nanochat/engine.py`：训练循环、KV Cache 推理、混合精度训练
+- `nanochat/tokenizer.py`：分词器，如何把原始文本转成 token ID
+- `nanochat/optim.py`：MuonAdamW 优化器，不同参数组用不同学习率
+- `nanochat/flash_attention.py`：Flash Attention 封装，自动选 FA3 或 SDPA 回退
+
+---
+
+*本文档基于 nanochat/gpt.py 当前实现整理。如有更新，请以代码为准。*
